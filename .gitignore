@@ -1,0 +1,12 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output & Test artifacts
+output/
+test_output/
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+invoice_id,amount,currency,customer_name,date
+INV-1001,1500.0,USD,Acme Corp,2026-08-01
+INV-1002,2500.0,USD,Beta LLC,2026-08-02
+INV-1003,3200.0,USD,Gamma Inc,2026-08-03
+INV-1004,4500.0,USD,Delta Co,2026-08-04
+INV-1005,1200.0,EUR,Epsilon Ltd,2026-08-05
+INV-1007,800.0,USD,Zeta Enterprises,2026-08-07
+INV-1007,800.0,USD,Zeta Enterprises,2026-08-07

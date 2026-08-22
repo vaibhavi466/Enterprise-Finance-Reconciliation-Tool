@@ -1,56 +1,56 @@
 # 🏦 Enterprise Finance Reconciliation Tool
 
-A production-style Python automation tool that reconciles financial records between an **ERP / System of Record** and an **External / Bank file** — classifying every record with a clear status and generating a business-friendly Excel report.
+A production-style Python automation tool that reconciles financial records between an **ERP / System of Record** and an **External / Bank file** — classifying every record with a clear status and generating a business-friendly multi-sheet Excel report.
 
 ---
 
 ## 📌 Overview
 
-Manual reconciliation between ERP systems and bank statements is one of the most time-consuming tasks in finance operations. This tool automates that process end-to-end: ingesting two data sources, comparing them intelligently, and producing a structured output that a finance team can act on immediately.
+Manual reconciliation between ERP systems and bank statements is one of the most time-consuming and error-prone tasks in finance operations. This tool automates that process end-to-end: ingesting two data sources, sanitizing input formatting, isolating data quality issues, intelligently matching records, and producing a structured Excel output ready for executive audit.
 
 ---
 
 ## ✅ Classification Categories
 
-| Status | Description |
+| Category | Description |
 |---|---|
-| ✅ **Match** | Record is fully aligned across both systems |
-| ⚠️ **Mismatch** | Record exists in both but differs in Amount, Currency, or Date |
+| ✅ **Matches** | Record is fully aligned across all shared fields in both systems |
+| ⚠️ **Mismatches** | Record exists in both systems but differs in Amount, Currency, Date, etc. |
 | ❌ **Missing** | Record is present in one system but absent in the other |
-| 🔁 **Data Issues** | Duplicate records detected before reconciliation |
+| 🔁 **Data Issues** | Duplicate primary keys detected and isolated prior to matching |
 
 ---
 
-## 🧠 Key Design Decisions
+## 🧠 Key Architecture & Design Decisions
 
-- **Configurable amount tolerance** — handles real-world rounding differences (default: ±0.01)
-- **Dynamic field-level comparison** — not hardcoded; works across any shared columns between the two files
-- **Duplicate isolation** — duplicates are detected and removed *before* the merge step, preventing false matches
-- **Mismatch reasons** — each mismatch row includes a human-readable explanation of *which* fields diverged
-- **Scalable input handling** — accepts `.csv`, `.xlsx`, or `.xls` for both input files
+- **Strict Duplicate Isolation** — Primary key duplicates are flagged and isolated *prior* to merging. This prevents false positive matches and duplicate fan-out in outer joins.
+- **Smart Amount Tolerance Parsing** — Currency values (e.g., `"$1,500.00"` vs `1500.0`) are automatically parsed and compared using a configurable floating-point tolerance threshold (default: `±0.01`).
+- **Targeted Field Comparison** — Numeric tolerance is scoped exclusively to amount/financial fields (`amount`, `price`, `fee`, `total`), preventing false matches on numerical IDs or codes (`customer_id`, `zip_code`).
+- **Human-Readable Mismatch Annotations** — Each mismatch row generates an explicit reason string detailing exactly *which* fields diverged (e.g., `amount diff (ERP: 3200.0, Bank: $3,250.00)`).
+- **Clean Audit Reports** — Low-level pandas implementation details (such as `_merge` columns) are mapped to business terms (`Present in ERP only (Missing in Bank)`).
 
 ---
 
-## 📊 Output
+## 📊 Output Excel Structure
 
-A single timestamped Excel file with multiple sheets:
+The tool outputs a single timestamped Excel file (`reconciliation_output_YYYYMMDD_HHMMSS.xlsx`) with the following worksheets:
 
-| Sheet | Contents |
+| Sheet Name | Description |
 |---|---|
-| `summary` | Count of Matches, Mismatches, Missing, Data Issues |
+| `summary` | Executive metrics dashboard (Total records ingested, counts per category) |
 | `matches` | All fully reconciled records |
-| `mismatches` | Records with field-level differences + reason |
-| `missing` | Records not found in one of the systems |
-| `data_issues` | Duplicate records from either source |
-| `detailed` | Full merged dataset with all statuses |
+| `mismatches` | Records with field-level differences + human-readable mismatch reasons |
+| `missing` | Unmatched records annotated with source of absence |
+| `data_issues` | Isolated duplicate records from ERP or Bank |
+| `detailed` | Complete merged dataset with reconciliation status annotations |
 
 ---
 
-## 🛠️ Stack
+## 🛠️ Stack & Dependencies
 
 - **Python 3.x**
-- **Pandas** — data ingestion, merging, comparison
-- **OpenPyXL** — Excel output
+- **Pandas** — Data ingestion, cleaning, deduplication, and vector merging
+- **OpenPyXL** — Excel workbook generation
 
 ---
 
@@ -62,22 +62,32 @@ A single timestamped Excel file with multiple sheets:
 pip install pandas openpyxl
 ```
 
-### 2. Run the script
+### 2. Generate sample data (Optional)
+
+```bash
+python generate_sample_data.py
+```
+
+### 3. Run reconciliation
 
 ```bash
 python reconciliation.py
 ```
 
-The tool will prompt you for:
-- Path to the ERP / System of Record file
-- Path to the External / Bank file
-- Output folder path
+The CLI tool will prompt you for:
+- Path to the ERP / System of Record file (e.g., `sample_data/erp_data.csv`)
+- Path to the External / Bank file (e.g., `sample_data/bank_data.xlsx`)
+- Output directory path (e.g., `output`)
+- Primary key column name (default: `invoice_id`)
 
-### 3. Collect your report
+---
 
-The output file is saved as:
-```
-reconciliation_output_YYYYMMDD_HHMMSS.xlsx
+## 🧪 Automated Testing
+
+Run the included `unittest` test suite to verify ingestion, numeric parsing, duplicate isolation, and Excel generation:
+
+```bash
+python test_reconciliation.py
 ```
 
 ---
@@ -85,23 +95,17 @@ reconciliation_output_YYYYMMDD_HHMMSS.xlsx
 ## 📁 File Structure
 
 ```
-├── reconciliation.py       # Main script
-├── README.md               # This file
-└── sample_data/            # (Optional) Sample input files for testing
+├── reconciliation.py          # Main enterprise reconciliation engine & CLI
+├── test_reconciliation.py     # Automated unit test suite
+├── generate_sample_data.py    # Helper script to generate mock financial files
+├── sample_data/               # Sample input datasets (CSV & XLSX)
+│   ├── erp_data.csv
+│   └── bank_data.xlsx
+└── README.md                  # System documentation
 ```
 
 ---
 
-## 💡 Use Cases
+## 👤 Author & Architecture Note
 
-This pattern applies directly to:
-- **Financial close reconciliation** (ERP vs bank)
-- **Data quality governance** across systems
-- **Fraud detection** — surfacing discrepancies automatically
-- **Audit trail generation** for finance teams
-
----
-
-## 👤 Author
-
-Built as part of a hands-on data governance and finance automation exercise, with a focus on production-level thinking over just making it work.
+Engineered as a production-style finance automation tool with defensive data handling, clear auditability, and automated verification.
