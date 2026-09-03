@@ -3,10 +3,23 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Environment & Virtualenvs
+.venv/
+venv/
+ENV/
+env/
+.env
+
 # Output & Test artifacts
 output/
 test_output/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
 
-# OS metadata
+# IDE & OS metadata
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db

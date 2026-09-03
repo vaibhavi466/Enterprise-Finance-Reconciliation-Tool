@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enterprise-finance-reconciliation-tool"
+version = "1.0.0"
+description = "Rule-driven Python finance reconciliation engine with duplicate isolation, tolerance-based matching, exception reporting, and auditable Excel outputs."
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = [
+    "python",
+    "pandas",
+    "finance",
+    "reconciliation",
+    "automation",
+    "data-quality",
+    "excel",
+    "fintech",
+    "data-engineering",
+]
+dependencies = [
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
