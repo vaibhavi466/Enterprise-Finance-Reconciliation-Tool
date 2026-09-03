@@ -3,19 +3,23 @@
   "field_rules": {
     "amount": {
       "type": "money",
-      "tolerance": "0.01"
+      "tolerance": "0.01",
+      "required": true
     },
     "currency": {
       "type": "text",
-      "case_sensitive": false
+      "case_sensitive": false,
+      "required": true
     },
     "customer_name": {
       "type": "text",
-      "case_sensitive": false
+      "case_sensitive": false,
+      "required": false
     },
     "date": {
       "type": "date",
-      "format": "%Y-%m-%d"
+      "format": "%Y-%m-%d",
+      "required": true
     }
   }
 }
