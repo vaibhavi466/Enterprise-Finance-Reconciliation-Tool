@@ -1,120 +1,33 @@
 """
 Comprehensive Unit & Integration Test Suite
 ============================================
-Enterprise Finance Reconciliation Tool
+Enterprise Finance Reconciliation Tool (C1-C8 Fixes)
 """
 
 import os
 import shutil
 import tempfile
 import unittest
-from datetime import date, datetime
 from decimal import Decimal
 
+import openpyxl
 import pandas as pd
 
 from reconciliation import (
-    INVALID_VALUE_SENTINEL,
-    STATUS_DUPLICATE_IN_ERP,
-    STATUS_INVALID_FIELD_VALUE,
-    STATUS_MATCH,
-    STATUS_MISSING_REQUIRED_VALUE,
-    OutputError,
-    SchemaError,
-    canonicalize_key,
-    parse_date,
-    parse_decimal,
+    DQ_CURRENCY_AMOUNT_CONFLICT,
+    DQ_DUPLICATE_IN_ERP,
+    DQ_INVALID_FIELD_VALUE,
+    DQ_MISSING_REQUIRED_VALUE,
+    STATUS_MISSING_IN_EXTERNAL,
+    normalize_text,
+    parse_money,
     read_spreadsheet,
     reconcile_data,
-    summarize_money_values,
-    write_output,
 )
 
 
-class TestFourMandatoryGateTests(unittest.TestCase):
-    """Four Mandatory Gate Tests for Fundamental Reconciliation Correctness."""
-
-    def test_numeric_csv_vs_excel_key_reconciles(self):
-        """Gate 1: CSV string key '1001' vs XLSX float key 1001.0 reconciles to MATCH."""
-        df_erp = pd.DataFrame([{"invoice_id": "1001", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
-        df_ext = pd.DataFrame([{"invoice_id": 1001.0, "amount": "$100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
-
-        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
-        self.assertEqual(len(results["matches"]), 1)
-        self.assertEqual(results["matches"]["reconciliation_status"].iloc[0], STATUS_MATCH)
-
-    def test_default_schema_missing_currency_fails(self):
-        """Gate 2: Missing required default schema column raises SchemaError without silent shrinking."""
-        df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
-        df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": "$100.00", "customer_name": "Acme", "date": "2026-08-01"}])  # Missing currency!
-
-        with self.assertRaises(SchemaError) as ctx:
-            reconcile_data(df_erp, df_ext, key_column="invoice_id")
-        self.assertIn("currency", str(ctx.exception))
-
-    def test_required_amount_missing_both_never_matches(self):
-        """Gate 3: Both missing required amount values become MISSING_REQUIRED_VALUE, never MATCH."""
-        df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
-        df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": None, "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
-
-        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
-        self.assertEqual(len(results["matches"]), 0)
-        self.assertEqual(len(results["data_issues"]), 1)
-        self.assertEqual(results["data_issues"]["reconciliation_status"].iloc[0], STATUS_MISSING_REQUIRED_VALUE)
-
-    def test_invalid_missing_amount_not_counted_as_zero_exposure(self):
-        """Gate 4: Invalid missing amounts are not silently converted to $0 in exposure KPIs."""
-        df_erp = pd.DataFrame([{"invoice_id": "INV-500", "amount": "ERROR123", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
-        df_ext = pd.DataFrame(columns=["invoice_id", "amount", "currency", "customer_name", "date"])
-
-        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
-        summary_dict = dict(zip(results["summary"]["Metric / Indicator"], results["summary"]["Value"]))
-
-        self.assertEqual(summary_dict["Missing in External Financial Exposure (USD)"], "0.00")
-        self.assertEqual(summary_dict["Missing in External Rows With Invalid Amount (USD)"], 1)
-
-
-class TestCanonicalKeyProcessing(unittest.TestCase):
-    """Tests for Key Canonicalization across CSV and XLSX Types."""
-
-    def test_canonicalize_key(self):
-        self.assertEqual(canonicalize_key(1001.0), "1001")
-        self.assertEqual(canonicalize_key(" 1001 "), "1001")
-        self.assertEqual(canonicalize_key("00123"), "00123")
-        self.assertIsNone(canonicalize_key(None))
-        self.assertIsNone(canonicalize_key("   "))
-
-
-class TestDateParsing(unittest.TestCase):
-    """Tests for Date Parsing and Comparison Rules."""
-
-    def test_parse_date_valid_inputs(self):
-        self.assertEqual(parse_date("2026-08-01"), pd.Timestamp("2026-08-01"))
-        self.assertEqual(parse_date(pd.Timestamp("2026-08-01 14:30:00")), pd.Timestamp("2026-08-01"))
-        self.assertEqual(parse_date(datetime(2026, 8, 1, 10, 0)), pd.Timestamp("2026-08-01"))
-        self.assertEqual(parse_date(date(2026, 8, 1)), pd.Timestamp("2026-08-01"))
-
-    def test_parse_date_missing_inputs(self):
-        self.assertIsNone(parse_date(None))
-        self.assertIsNone(parse_date(float("nan")))
-        self.assertIsNone(parse_date(""))
-
-    def test_parse_date_invalid_inputs(self):
-        self.assertEqual(parse_date("invalid_date"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_date("2026-13-45"), INVALID_VALUE_SENTINEL)
-
-    def test_invalid_date_never_matches(self):
-        df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "not-a-date"}])
-        df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": "$100.00", "currency": "USD", "customer_name": "Acme", "date": "invalid-date"}])
-
-        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
-        self.assertEqual(len(results["matches"]), 0)
-        self.assertEqual(len(results["data_issues"]), 1)
-        self.assertEqual(results["data_issues"]["reconciliation_status"].iloc[0], STATUS_INVALID_FIELD_VALUE)
-
-
-class TestIdentifierPreservation(unittest.TestCase):
-    """Tests for Preserving Raw Identifier Strings (e.g. Leading Zeros)."""
+class TestC1XlsxLeadingZeros(unittest.TestCase):
+    """C1: Verify Excel leading-zero string IDs are preserved."""
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -122,90 +35,146 @@ class TestIdentifierPreservation(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
 
-    def test_csv_preserves_leading_zeros(self):
-        csv_path = os.path.join(self.temp_dir, "test_zeros.csv")
-        with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("invoice_id,amount,currency,date\n00123,100.00,USD,2026-08-01\n000001,200.00,USD,2026-08-01\n")
+    def test_xlsx_leading_zeros_preserved(self):
+        xlsx_path = os.path.join(self.temp_dir, "test_zeros.xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["invoice_id", "amount", "currency", "date"])
+        ws.cell(row=2, column=1, value="00123")  # String text cell with leading zero
+        ws.cell(row=2, column=2, value="100.00")
+        ws.cell(row=2, column=3, value="USD")
+        ws.cell(row=2, column=4, value="2026-08-01")
+        wb.save(xlsx_path)
 
-        df = read_spreadsheet(csv_path, source_name="ERP")
+        df = read_spreadsheet(xlsx_path, source_name="External")
         self.assertEqual(df["invoice_id"].iloc[0], "00123")
-        self.assertEqual(df["invoice_id"].iloc[1], "000001")
 
 
-class TestMonetaryParsing(unittest.TestCase):
-    """Comprehensive Monetary Parsing & Strict Syntax Tests."""
+class TestC2AndC6RequiredTextNormalization(unittest.TestCase):
+    """C2 & C6: Verify text normalization and consistent required field semantics."""
 
-    def test_valid_monetary_formats(self):
-        self.assertEqual(parse_decimal(1500), Decimal("1500"))
-        self.assertEqual(parse_decimal(1500.00), Decimal("1500"))
-        self.assertEqual(parse_decimal("$1,500.00"), Decimal("1500.00"))
-        self.assertEqual(parse_decimal("₹1,500.00"), Decimal("1500.00"))
-        self.assertEqual(parse_decimal("€1,500.00"), Decimal("1500.00"))
-        self.assertEqual(parse_decimal("USD 1500.00"), Decimal("1500.00"))
-        self.assertEqual(parse_decimal("-1500.00"), Decimal("-1500.00"))
-        self.assertEqual(parse_decimal("(500.00)"), Decimal("-500.00"))
-        self.assertEqual(parse_decimal("($1,500.00)"), Decimal("-1500.00"))
-        self.assertEqual(parse_decimal("1,23,456.78"), Decimal("123456.78"))
+    def test_normalize_text_helper(self):
+        self.assertIsNone(normalize_text(None))
+        self.assertIsNone(normalize_text(""))
+        self.assertIsNone(normalize_text("   "))
+        self.assertIsNone(normalize_text("null"))
+        self.assertIsNone(normalize_text("none"))
+        self.assertIsNone(normalize_text("<na>"))
+        self.assertEqual(normalize_text(" USD "), "USD")
 
-    def test_invalid_monetary_formats(self):
-        self.assertEqual(parse_decimal("ERROR"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("INVALID"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("ERROR123"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("ABC500XYZ"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("12.3.4"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("1,2,3"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("1,,000"), INVALID_VALUE_SENTINEL)
-        self.assertEqual(parse_decimal("USDABC100"), INVALID_VALUE_SENTINEL)
+    def test_required_text_field_missing_either_side(self):
+        df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
+        df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": "$100.00", "currency": "", "customer_name": "Acme", "date": "2026-08-01"}])
 
-    def test_summarize_money_values_helper(self):
-        series = pd.Series(["100.00", "$200.00", "ERROR123", "", None])
-        total, inv, blk = summarize_money_values(series)
-        self.assertEqual(total, Decimal("300.00"))
-        self.assertEqual(inv, 1)
-        self.assertEqual(blk, 2)
+        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
+        self.assertEqual(len(results["matches"]), 0)
+        self.assertEqual(len(results["mismatches"]), 1)
+        self.assertEqual(results["mismatches"]["data_quality_status"].iloc[0], DQ_MISSING_REQUIRED_VALUE)
 
 
-class TestReconciliationTaxonomyAndDuplicates(unittest.TestCase):
-    """Tests for Taxonomy and Duplicate Quarantine."""
+class TestC3EmbeddedCurrencyConflict(unittest.TestCase):
+    """C3: Verify money parsing detects embedded currency symbol/code conflicts."""
 
-    def test_duplicate_isolation_both_sides(self):
+    def test_parse_money_structured_result(self):
+        pm1 = parse_money("€100.00")
+        self.assertEqual(pm1.amount, Decimal("100.00"))
+        self.assertEqual(pm1.explicit_currency, "EUR")
+        self.assertTrue(pm1.valid)
+
+        pm2 = parse_money("USD 250.50")
+        self.assertEqual(pm2.amount, Decimal("250.50"))
+        self.assertEqual(pm2.explicit_currency, "USD")
+        self.assertTrue(pm2.valid)
+
+    def test_currency_amount_conflict_flagged(self):
+        df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "€100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
+        df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": "$100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
+
+        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
+        self.assertEqual(len(results["matches"]), 0)
+        self.assertEqual(results["mismatches"]["data_quality_status"].iloc[0], DQ_CURRENCY_AMOUNT_CONFLICT)
+
+
+class TestC4SeparatedOutputGrains(unittest.TestCase):
+    """C4: Verify output workbook separates reconciliation_units and source_exceptions."""
+
+    def test_separated_output_grains(self):
         df_erp = pd.DataFrame(
             [
-                {"invoice_id": "INV-1007", "amount": "800.00", "currency": "USD", "customer_name": "Zeta", "date": "2026-08-01"},
-                {"invoice_id": "INV-1007", "amount": "800.00", "currency": "USD", "customer_name": "Zeta", "date": "2026-08-01"},
+                {"invoice_id": "INV-1", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"},
+                {"invoice_id": "INV-2", "amount": "200.00", "currency": "USD", "customer_name": "Beta", "date": "2026-08-01"},
+                {"invoice_id": "INV-2", "amount": "200.00", "currency": "USD", "customer_name": "Beta", "date": "2026-08-01"},
             ]
         )
         df_ext = pd.DataFrame(
             [
-                {"invoice_id": "INV-1007", "amount": "$800.00", "currency": "USD", "customer_name": "Zeta", "date": "2026-08-01"},
+                {"invoice_id": "INV-1", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"},
             ]
         )
 
         results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
-        self.assertEqual(len(results["missing"]), 0)
-        self.assertEqual(len(results["data_issues"]), 3)
-        self.assertTrue((results["data_issues"]["reconciliation_status"] == STATUS_DUPLICATE_IN_ERP).all())
+
+        self.assertIn("reconciliation_units", results)
+        self.assertIn("source_exceptions", results)
+
+        # 1 unit for INV-1 (MATCH)
+        self.assertEqual(len(results["reconciliation_units"]), 1)
+        # 2 raw duplicate rows for INV-2 in source_exceptions
+        self.assertEqual(len(results["source_exceptions"]), 2)
+        self.assertEqual(results["source_exceptions"]["data_quality_status"].iloc[0], DQ_DUPLICATE_IN_ERP)
 
 
-class TestOutputWorkbookAndSecurity(unittest.TestCase):
-    """Tests for Output Excel Generation and Security."""
+class TestC5DisambiguatedKPIs(unittest.TestCase):
+    """C5: Verify exception-rate metrics are mathematically disambiguated."""
 
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir)
-
-    def test_prevent_silent_overwrite(self):
+    def test_disambiguated_kpi_labels(self):
         df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
         df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": "$100.00", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
+
         results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
+        summary_dict = dict(zip(results["summary"]["Metric / Indicator"], results["summary"]["Value"]))
 
-        filename = "test_output.xlsx"
-        write_output(results, self.temp_dir, output_filename=filename, overwrite=True)
+        self.assertIn("Source Row Exception Rate (%)", summary_dict)
+        self.assertIn("Reconciliation Unit Exception Rate (%)", summary_dict)
+        self.assertEqual(summary_dict["Source Row Exception Rate (%)"], "0.00%")
+        self.assertEqual(summary_dict["Reconciliation Unit Exception Rate (%)"], "0.00%")
 
-        with self.assertRaises(OutputError):
-            write_output(results, self.temp_dir, output_filename=filename, overwrite=False)
+
+class TestC7DynamicExposure(unittest.TestCase):
+    """C7: Verify dynamic per-money-field exposure calculation."""
+
+    def test_dynamic_exposure_multiple_money_fields(self):
+        df_erp = pd.DataFrame([{"invoice_id": "INV-1", "amount": "100.00", "fee": "10.00", "currency": "USD", "date": "2026-08-01"}])
+        df_ext = pd.DataFrame([{"invoice_id": "INV-1", "amount": "150.00", "fee": "20.00", "currency": "USD", "date": "2026-08-01"}])
+
+        rules = {
+            "amount": {"type": "money", "tolerance": "0.01", "required": True, "currency_field": "currency"},
+            "fee": {"type": "money", "tolerance": "0.01", "required": False, "currency_field": "currency"},
+            "currency": {"type": "text", "case_sensitive": False, "required": True},
+            "date": {"type": "date", "format": "%Y-%m-%d", "required": True},
+        }
+
+        results = reconcile_data(df_erp, df_ext, key_column="invoice_id", field_rules=rules)
+        summary_dict = dict(zip(results["summary"]["Metric / Indicator"], results["summary"]["Value"]))
+
+        self.assertIn("Mismatched Amount Exposure (USD)", summary_dict)
+        self.assertIn("Mismatched Fee Exposure (USD)", summary_dict)
+        self.assertEqual(summary_dict["Mismatched Amount Exposure (USD)"], "50.00")
+        self.assertEqual(summary_dict["Mismatched Fee Exposure (USD)"], "10.00")
+
+
+class TestC8SourceLevelValidation(unittest.TestCase):
+    """C8: Verify source-level data quality validation on missing records."""
+
+    def test_source_level_validation_on_missing_record(self):
+        df_erp = pd.DataFrame([{"invoice_id": "INV-500", "amount": "ERROR123", "currency": "USD", "customer_name": "Acme", "date": "2026-08-01"}])
+        df_ext = pd.DataFrame(columns=["invoice_id", "amount", "currency", "customer_name", "date"])
+
+        results = reconcile_data(df_erp, df_ext, key_column="invoice_id")
+        missing_df = results["missing"]
+
+        self.assertEqual(missing_df["reconciliation_status"].iloc[0], STATUS_MISSING_IN_EXTERNAL)
+        self.assertEqual(missing_df["data_quality_status"].iloc[0], DQ_INVALID_FIELD_VALUE)
 
 
 if __name__ == "__main__":

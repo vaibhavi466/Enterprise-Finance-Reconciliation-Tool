@@ -4,7 +4,8 @@
     "amount": {
       "type": "money",
       "tolerance": "0.01",
-      "required": true
+      "required": true,
+      "currency_field": "currency"
     },
     "currency": {
       "type": "text",
