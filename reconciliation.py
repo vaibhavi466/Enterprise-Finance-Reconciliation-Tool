@@ -4,44 +4,48 @@ Enterprise Finance Reconciliation Tool
 
 Purpose:
 --------
-Performs automated end-to-end reconciliation of financial records between an Enterprise
-System of Record (ERP) and an External Source (Bank / Payment Gateway / Partner).
+Performs automated, deterministic, rule-driven financial reconciliation between an
+Enterprise System of Record (ERP) and an External Source (Bank / Payment Gateway / Partner).
 
-Key Features:
--------------
-1. Multi-format Ingestion: Ingests CSV and XLSX files defensively with SHA-256 hash tracking.
-2. Data Sanitization & Collision Prevention: Normalizes headers to snake_case and detects header collisions.
-3. Explicit Schema & Typed Rules: Replaces substring searching with typed comparison rules
-   (Money, Text, Date) and exact Decimal representation for financial amounts.
-4. Strict Key Quarantine: Isolates missing primary keys (MISSING_PRIMARY_KEY) and ambiguous duplicate
-   keys (DUPLICATE_KEY_IN_ERP, DUPLICATE_KEY_IN_EXTERNAL, DUPLICATE_KEY_IN_BOTH) prior to matching.
-5. One-to-One Vectorized Reconciliation: Merges clean datasets under strict 1-to-1 validation constraints.
-6. Comprehensive Audit Reporting: Multi-sheet Excel workbook with executive summary KPIs, currency-grouped
-   exposures, run metadata, formula injection protection, and source row traceability.
+Key Principles:
+---------------
+1. Explicit Configuration: Zero substring-based field type inference. Field rules (money, text, date)
+   are explicitly defined, validated, and serialized for auditability.
+2. Raw Identifier Preservation: Preserves leading zeros and raw strings during ingestion.
+3. Decimal Financial Precision: Uses decimal.Decimal and strict monetary syntax rules.
+4. Strict Key & Duplicate Quarantine: Isolates invalid keys (MISSING_PRIMARY_KEY) and ambiguous duplicate
+   keys (DUPLICATE_KEY_IN_ERP, DUPLICATE_KEY_IN_EXTERNAL, DUPLICATE_KEY_IN_BOTH) deterministically.
+5. One-to-One Vector Outer Merge: Merges clean datasets under pandas validate="one_to_one" constraints.
+6. Multi-Money Field & Currency Exposure: Computes per-field monetary variances and isolates cross-currency
+   mismatches without invalid cross-currency variance summing.
+7. Auditable Reporting: Multi-sheet Excel workbook with UTC timestamps, SHA-256 file/config hashes,
+   source row lineage, formula injection hardening, and collision-resistant output paths.
 """
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import re
 import sys
 import uuid
-from datetime import datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import pandas as pd
 import openpyxl
+import pandas as pd
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# Set up logger
 logger = logging.getLogger("reconciliation")
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx"}
 DEFAULT_TOLERANCE = Decimal("0.01")
 DEFAULT_KEY_COLUMN = "invoice_id"
+INTERNAL_PREFIX = "_recon_"
 
 # Machine-readable status taxonomy constants
 STATUS_MATCH = "MATCH"
@@ -56,6 +60,7 @@ STATUS_INVALID_FIELD_VALUE = "INVALID_FIELD_VALUE"
 
 INVALID_VALUE_SENTINEL = "<INVALID_FIELD_VALUE>"
 
+# Allowed currency codes and symbols for money parsing
 CURRENCY_PATTERN = re.compile(
     r"[$₹€£¥]|Rs\.?|\b(USD|EUR|INR|GBP|CAD|AUD|JPY|CHF|CNY|HKD|NZD)\b",
     re.IGNORECASE,
@@ -64,26 +69,46 @@ CURRENCY_PATTERN = re.compile(
 
 class ReconciliationError(Exception):
     """Base exception for reconciliation failures."""
+
     pass
 
 
 class ConfigurationError(ReconciliationError):
-    """Raised when configuration parameters are invalid."""
+    """Raised when configuration parameters or field rules are invalid."""
+
     pass
 
 
 class SchemaError(ReconciliationError):
     """Raised when dataset schemas or header validations fail."""
+
     pass
 
 
 class IngestionError(ReconciliationError):
     """Raised when file reading or ingestion fails."""
+
     pass
 
 
+class OutputError(ReconciliationError):
+    """Raised when output file writing or overwrite checks fail."""
+
+    pass
+
+
+def get_tool_version() -> str:
+    """Returns dynamic package version or fallback."""
+    try:
+        return version("enterprise-finance-reconciliation-tool")
+    except PackageNotFoundError:
+        return "1.0.0"
+    except Exception:
+        return "1.0.0"
+
+
 def calculate_file_hash(file_path: str) -> str:
-    """Calculates SHA-256 hash of a file for run auditability."""
+    """Calculates SHA-256 hash of a file for auditability."""
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -94,8 +119,9 @@ def calculate_file_hash(file_path: str) -> str:
 def read_spreadsheet(file_path: str, source_name: str = "Source") -> pd.DataFrame:
     """
     Reads a CSV or XLSX file into a pandas DataFrame.
-    Attaches source row traceability metadata (_source_row_<source_name>).
-    Header is row 1, first data row is row 2.
+    Preserves raw string identifiers (keep_default_na=False, dtype=str for CSV).
+    Validates that no reserved internal '_recon_' columns pre-exist in input file.
+    Attaches source row traceability metadata (_recon_source_row_<source_name>).
     """
     file_path = file_path.strip().strip('"').strip("'")
     if not os.path.exists(file_path):
@@ -105,20 +131,22 @@ def read_spreadsheet(file_path: str, source_name: str = "Source") -> pd.DataFram
     ext = ext.lower()
 
     if ext not in SUPPORTED_EXTENSIONS:
-        raise IngestionError(
-            f"Unsupported file extension '{ext}' for {source_name}. Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
-        )
+        raise IngestionError(f"Unsupported file extension '{ext}' for {source_name}. Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
 
     try:
         if ext == ".csv":
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
         else:
             df = pd.read_excel(file_path, engine="openpyxl")
     except Exception as e:
         raise IngestionError(f"Failed to read {source_name} file '{file_path}': {e}") from e
 
-    # Source row traceability: header is row 1, data rows start at row 2
-    row_col_name = f"_source_row_{source_name.lower().replace(' ', '_')}"
+    # Reserved internal namespace check
+    for col in df.columns:
+        if str(col).startswith(INTERNAL_PREFIX):
+            raise SchemaError(f"Input dataset {source_name} contains reserved internal column prefix '{INTERNAL_PREFIX}': '{col}'")
+
+    row_col_name = f"{INTERNAL_PREFIX}source_row_{source_name.lower().replace(' ', '_')}"
     df[row_col_name] = range(2, len(df) + 2)
 
     return df
@@ -127,7 +155,6 @@ def read_spreadsheet(file_path: str, source_name: str = "Source") -> pd.DataFram
 def sanitize_column_name(col: Any) -> str:
     """
     Normalizes column headers to lowercase snake_case.
-    Handles spaces, hyphens, punctuation, and leading/trailing separators.
     Example: 'Invoice-ID!' -> 'invoice_id'
     """
     s = str(col).strip().lower()
@@ -139,19 +166,18 @@ def sanitize_column_name(col: Any) -> str:
 
 def preprocess_data(df: pd.DataFrame, source_name: str = "Source") -> pd.DataFrame:
     """
-    Cleans and standardizes the DataFrame:
-    - Normalizes column names and checks for collision errors.
+    Standardizes the DataFrame:
+    - Normalizes column names and checks for header collision errors.
     - Trims whitespace from string cells.
     - Drops completely empty rows (preserving source traceability).
     """
     df = df.copy()
 
-    # Column normalization and collision detection
     sanitized_map: Dict[str, List[str]] = {}
     new_columns = []
 
     for orig_col in df.columns:
-        if str(orig_col).startswith("_source_row_"):
+        if str(orig_col).startswith(INTERNAL_PREFIX):
             new_columns.append(orig_col)
             continue
         clean_col = sanitize_column_name(orig_col)
@@ -161,17 +187,12 @@ def preprocess_data(df: pd.DataFrame, source_name: str = "Source") -> pd.DataFra
     collisions = {k: v for k, v in sanitized_map.items() if len(v) > 1}
     if collisions:
         collision_details = "; ".join([f"'{k}': {v}" for k, v in collisions.items()])
-        raise SchemaError(
-            f"Header normalization collision detected in {source_name}: {collision_details}"
-        )
+        raise SchemaError(f"Header normalization collision detected in {source_name}: {collision_details}")
 
     df.columns = new_columns
 
-    # Drop rows where all business columns (excluding source row metadata) are null
-    biz_cols = [c for c in df.columns if not c.startswith("_source_row_")]
+    biz_cols = [c for c in df.columns if not c.startswith(INTERNAL_PREFIX)]
     df = df.dropna(how="all", subset=biz_cols)
-
-    # Trim leading/trailing string whitespace
     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
 
     return df
@@ -182,13 +203,14 @@ def parse_decimal(val: Any) -> Union[Decimal, None, str]:
     Safely parses financial amounts into decimal.Decimal.
 
     Supports:
-    - 1500, 1500.00, $1,500.00, ₹1,500.00, €1,500.00, USD 1500.00
-    - Negative amounts: -1500.00, (500.00)
+    - 1500, 1500.00, 1,500.00, $1,500.00, ₹1,500.00, €1,500.00, USD 1500.00
+    - Negative amounts: -1500.00, (500.00), ($1,500.00)
+    - Indian grouping: 1,23,456.78
 
     Returns:
     - Decimal object for valid monetary values
     - None for missing/null/blank values
-    - INVALID_VALUE_SENTINEL for malformed non-financial values (e.g. 'ERROR123', '12.3.4')
+    - INVALID_VALUE_SENTINEL for malformed non-financial values (ERROR123, ABC500XYZ, 12.3.4, 1,2,3)
     """
     if val is None or pd.isna(val):
         return None
@@ -213,20 +235,59 @@ def parse_decimal(val: Any) -> Union[Decimal, None, str]:
         is_parenthesized_negative = True
         val_str = val_str[1:-1].strip()
 
-    # Strip recognized currency symbols/codes, commas, and spaces
-    cleaned = CURRENCY_PATTERN.sub("", val_str)
-    cleaned = cleaned.replace(",", "").replace(" ", "")
+    # Strip currency tokens
+    without_currency = CURRENCY_PATTERN.sub("", val_str).strip()
 
+    # Validate numeric string syntax BEFORE removing commas
+    # Western grouping: 1,500.00 or 1500.00 | Indian grouping: 1,23,456.78 | Simple: 1500
+    valid_syntax = (
+        re.match(r"^-?\d{1,3}(,\d{3})+(\.\d+)?$", without_currency)
+        or re.match(r"^-?\d{1,3}(,\d{2})*(,\d{3})+(\.\d+)?$", without_currency)
+        or re.match(r"^-?\d+(\.\d+)?$", without_currency)
+    )
+
+    if not valid_syntax:
+        return INVALID_VALUE_SENTINEL
+
+    cleaned = without_currency.replace(",", "")
     if is_parenthesized_negative and not cleaned.startswith("-"):
         cleaned = f"-{cleaned}"
-
-    # Strict numeric validation regex: allows optional leading minus and single decimal point
-    if not re.match(r"^-?\d+(\.\d+)?$", cleaned):
-        return INVALID_VALUE_SENTINEL
 
     try:
         return Decimal(cleaned)
     except InvalidOperation:
+        return INVALID_VALUE_SENTINEL
+
+
+def parse_date(val: Any, fmt: Optional[str] = "%Y-%m-%d") -> Union[pd.Timestamp, None, str]:
+    """
+    Safely parses dates into normalized pd.Timestamp.
+
+    Returns:
+    - pd.Timestamp (normalized to midnight) for valid dates
+    - None for missing/null/blank values
+    - INVALID_VALUE_SENTINEL for unparseable invalid date values
+    """
+    if val is None or pd.isna(val):
+        return None
+
+    if isinstance(val, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(val).normalize()
+
+    val_str = str(val).strip()
+    if not val_str or val_str.lower() in ("nan", "none", "null", "<na>"):
+        return None
+
+    try:
+        if fmt:
+            parsed = pd.to_datetime(val_str, format=fmt, errors="coerce")
+        else:
+            parsed = pd.to_datetime(val_str, errors="coerce")
+
+        if pd.isna(parsed):
+            return INVALID_VALUE_SENTINEL
+        return parsed.normalize()
+    except Exception:
         return INVALID_VALUE_SENTINEL
 
 
@@ -241,15 +302,94 @@ def is_valid_key(val: Any) -> bool:
 def sanitize_excel_cell_value(val: Any) -> Any:
     """
     Prevents Excel formula injection by prefixing text starting with '=', '+', '-', '@'
-    with a single quote, unless it is a valid numeric/date/boolean value.
+    with a single quote, unless it is a valid numeric value.
     """
     if isinstance(val, str) and val:
         if val[0] in ("=", "+", "-", "@"):
-            # Do not escape valid negative numbers
             if val[0] == "-" and re.match(r"^-?\d+(\.\d+)?$", val):
                 return val
             return f"'{val}"
     return val
+
+
+def get_default_field_rules(tolerance: Decimal) -> Dict[str, Dict[str, Any]]:
+    """Returns explicit default field rules."""
+    return {
+        "amount": {"type": "money", "tolerance": tolerance},
+        "currency": {"type": "text", "case_sensitive": False},
+        "customer_name": {"type": "text", "case_sensitive": False},
+        "date": {"type": "date", "format": "%Y-%m-%d"},
+    }
+
+
+def normalize_and_validate_field_rules(field_rules: Dict[str, Dict[str, Any]], key_column: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Normalizes configured field names to snake_case exactly once.
+    Validates rule types, tolerances, and parameter validity.
+    """
+    key_norm = sanitize_column_name(key_column)
+    normalized_rules: Dict[str, Dict[str, Any]] = {}
+
+    for orig_name, rule in field_rules.items():
+        if not isinstance(rule, dict):
+            raise ConfigurationError(f"Field rule for '{orig_name}' must be a dictionary.")
+
+        norm_name = sanitize_column_name(orig_name)
+        if norm_name == key_norm:
+            raise ConfigurationError(f"Primary key column '{key_column}' cannot be included in comparison field_rules.")
+        if norm_name in normalized_rules:
+            raise ConfigurationError(f"Duplicate field rule after normalization: '{orig_name}' and another field both normalize to '{norm_name}'")
+
+        f_type = str(rule.get("type", "")).strip().lower()
+        if f_type not in ("money", "text", "date"):
+            raise ConfigurationError(f"Invalid field type '{rule.get('type')}' for field '{orig_name}'. Allowed types: 'money', 'text', 'date'.")
+
+        validated_rule: Dict[str, Any] = {"type": f_type}
+
+        if f_type == "money":
+            raw_tol = rule.get("tolerance", DEFAULT_TOLERANCE)
+            try:
+                tol_dec = Decimal(str(raw_tol))
+            except (InvalidOperation, ValueError, TypeError):
+                raise ConfigurationError(f"Invalid monetary tolerance '{raw_tol}' for field '{orig_name}'.")
+            if tol_dec < Decimal("0"):
+                raise ConfigurationError(f"Monetary tolerance for field '{orig_name}' cannot be negative: {tol_dec}")
+            validated_rule["tolerance"] = tol_dec
+
+        elif f_type == "text":
+            case_sens = rule.get("case_sensitive", False)
+            if not isinstance(case_sens, bool):
+                raise ConfigurationError(f"Parameter 'case_sensitive' for field '{orig_name}' must be a boolean.")
+            validated_rule["case_sensitive"] = case_sens
+
+        elif f_type == "date":
+            fmt = rule.get("format", "%Y-%m-%d")
+            if fmt is not None and not isinstance(fmt, str):
+                raise ConfigurationError(f"Parameter 'format' for field '{orig_name}' must be a string format.")
+            validated_rule["format"] = fmt
+
+        normalized_rules[norm_name] = validated_rule
+
+    if not normalized_rules:
+        raise ConfigurationError("Zero valid comparison field rules were provided.")
+
+    return normalized_rules
+
+
+def load_config_file(config_path: str) -> Tuple[Dict[str, Any], str, str]:
+    """Loads configuration JSON file and returns (config_dict, key_column, config_hash)."""
+    config_path = config_path.strip().strip('"').strip("'")
+    if not os.path.exists(config_path):
+        raise ConfigurationError(f"Configuration file not found: '{config_path}'")
+
+    config_hash = calculate_file_hash(config_path)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        raise ConfigurationError(f"Failed to parse JSON config file '{config_path}': {e}") from e
+
+    return data, data.get("key_column", DEFAULT_KEY_COLUMN), config_hash
 
 
 def reconcile_data(
@@ -265,7 +405,7 @@ def reconcile_data(
     Core Financial Reconciliation Engine.
     """
     run_id = str(uuid.uuid4())
-    run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_timestamp_utc = datetime.now(timezone.utc).isoformat()
 
     if isinstance(amount_tolerance, (float, int, str)):
         try:
@@ -281,33 +421,28 @@ def reconcile_data(
     # 1. Key Column Presence Validation
     if key_col not in df_erp.columns:
         raise SchemaError(
-            f"Key column '{key_col}' not found in {source_erp_name}. Available columns: {[c for c in df_erp.columns if not c.startswith('_source_row_')]}"
+            f"Key column '{key_col}' not found in {source_erp_name}. Available columns: {[c for c in df_erp.columns if not c.startswith(INTERNAL_PREFIX)]}"
         )
     if key_col not in df_external.columns:
         raise SchemaError(
-            f"Key column '{key_col}' not found in {source_external_name}. Available columns: {[c for c in df_external.columns if not c.startswith('_source_row_')]}"
+            f"Key column '{key_col}' not found in {source_external_name}. Available columns: {[c for c in df_external.columns if not c.startswith(INTERNAL_PREFIX)]}"
         )
 
-    # 2. Configured Field Rules Setup & Validation
+    # 2. Field Rules Setup & Mandatory Validation
     if field_rules is None:
-        common_cols = [
-            c for c in df_erp.columns
-            if c in df_external.columns and c != key_col and not c.startswith("_source_row_")
-        ]
-        field_rules = {}
-        for c in common_cols:
-            if any(kw in c for kw in ["amount", "price", "fee", "total", "val", "cost", "sum"]):
-                field_rules[c] = {"type": "money", "tolerance": amount_tolerance}
-            elif "date" in c:
-                field_rules[c] = {"type": "date", "format": "%Y-%m-%d"}
-            else:
-                field_rules[c] = {"type": "text", "case_sensitive": False}
+        all_defaults = get_default_field_rules(amount_tolerance)
+        field_rules = {
+            col: rule for col, rule in all_defaults.items() if sanitize_column_name(col) in df_erp.columns and sanitize_column_name(col) in df_external.columns
+        }
+        if not field_rules:
+            common_cols = [c for c in df_erp.columns if c in df_external.columns and c != key_col and not c.startswith(INTERNAL_PREFIX)]
+            field_rules = {c: {"type": "text"} for c in common_cols}
 
+    normalized_rules = normalize_and_validate_field_rules(field_rules, key_col)
+
+    # Mandatory Schema Validation: Ensure every configured rule field exists in both datasets
     comparison_fields = []
-    for col, rules in field_rules.items():
-        clean_c = sanitize_column_name(col)
-        if clean_c == key_col:
-            continue
+    for clean_c in normalized_rules.keys():
         if clean_c in df_erp.columns and clean_c in df_external.columns:
             comparison_fields.append(clean_c)
         else:
@@ -316,28 +451,33 @@ def reconcile_data(
                 missing_in.append(source_erp_name)
             if clean_c not in df_external.columns:
                 missing_in.append(source_external_name)
-            raise SchemaError(
-                f"Required comparison field '{clean_c}' is missing in dataset(s): {', '.join(missing_in)}"
-            )
+            raise SchemaError(f"Configured comparison field '{clean_c}' is missing in dataset(s): {', '.join(missing_in)}")
 
     if not comparison_fields:
-        raise SchemaError("Zero valid comparison fields were supplied for reconciliation.")
+        raise SchemaError("Zero valid comparison fields exist for reconciliation.")
 
-    logger.info(
-        f"Starting reconciliation run {run_id}. Key: '{key_col}'. Compared fields: {comparison_fields}"
-    )
+    logger.info(f"Starting reconciliation run {run_id}. Key: '{key_col}'. Compared fields: {comparison_fields}")
 
-    # -------------------------------------------------------------
-    # 3. Primary Key Null / Invalid Quarantine
-    # -------------------------------------------------------------
-    erp_valid_key_mask = df_erp[key_col].apply(is_valid_key)
-    ext_valid_key_mask = df_external[key_col].apply(is_valid_key)
+    # 3. Attach Canonical Reconciliation Key (_recon_key)
+    df_erp[f"{INTERNAL_PREFIX}key"] = df_erp[key_col].astype(str).str.strip()
+    df_external[f"{INTERNAL_PREFIX}key"] = df_external[key_col].astype(str).str.strip()
 
-    df_erp_invalid_keys = df_erp[~erp_valid_key_mask].copy()
-    df_ext_invalid_keys = df_external[~ext_valid_key_mask].copy()
+    # 4. Primary Key Null / Invalid Quarantine
+    if df_erp.empty:
+        df_erp_valid = df_erp.copy()
+        df_erp_invalid_keys = df_erp.copy()
+    else:
+        erp_valid_key_mask = df_erp[key_col].apply(is_valid_key)
+        df_erp_invalid_keys = df_erp[~erp_valid_key_mask].copy()
+        df_erp_valid = df_erp[erp_valid_key_mask].copy()
 
-    df_erp_valid = df_erp[erp_valid_key_mask].copy()
-    df_ext_valid = df_external[ext_valid_key_mask].copy()
+    if df_external.empty:
+        df_ext_valid = df_external.copy()
+        df_ext_invalid_keys = df_external.copy()
+    else:
+        ext_valid_key_mask = df_external[key_col].apply(is_valid_key)
+        df_ext_invalid_keys = df_external[~ext_valid_key_mask].copy()
+        df_ext_valid = df_external[ext_valid_key_mask].copy()
 
     invalid_key_records = []
     if not df_erp_invalid_keys.empty:
@@ -352,24 +492,40 @@ def reconcile_data(
         df_ext_invalid_keys["source_system"] = source_external_name
         invalid_key_records.append(df_ext_invalid_keys)
 
-    # -------------------------------------------------------------
-    # 4. Duplicate Key Quarantine Logic
-    # -------------------------------------------------------------
-    erp_counts = df_erp_valid[key_col].value_counts()
-    ext_counts = df_ext_valid[key_col].value_counts()
+    # 5. Deterministic Duplicate Key Quarantine Logic
+    if df_erp_valid.empty or key_col not in df_erp_valid.columns:
+        erp_counts = pd.Series(dtype=int)
+    else:
+        erp_counts = df_erp_valid[key_col].value_counts()
+
+    if df_ext_valid.empty or key_col not in df_ext_valid.columns:
+        ext_counts = pd.Series(dtype=int)
+    else:
+        ext_counts = df_ext_valid[key_col].value_counts()
 
     erp_dupe_keys = set(erp_counts[erp_counts > 1].index)
     ext_dupe_keys = set(ext_counts[ext_counts > 1].index)
-    all_dupe_keys = erp_dupe_keys.union(ext_dupe_keys)
+    all_dupe_keys_set = erp_dupe_keys.union(ext_dupe_keys)
 
-    df_erp_dupes = df_erp_valid[df_erp_valid[key_col].isin(all_dupe_keys)].copy()
-    df_ext_dupes = df_ext_valid[df_ext_valid[key_col].isin(all_dupe_keys)].copy()
+    # Sort duplicate keys deterministically
+    sorted_dupe_keys = sorted(list(all_dupe_keys_set), key=str)
 
-    df_erp_clean = df_erp_valid[~df_erp_valid[key_col].isin(all_dupe_keys)].copy()
-    df_ext_clean = df_ext_valid[~df_ext_valid[key_col].isin(all_dupe_keys)].copy()
+    if df_erp_valid.empty or key_col not in df_erp_valid.columns:
+        df_erp_dupes = pd.DataFrame(columns=df_erp.columns)
+        df_erp_clean = df_erp_valid.copy()
+    else:
+        df_erp_dupes = df_erp_valid[df_erp_valid[key_col].isin(all_dupe_keys_set)].copy()
+        df_erp_clean = df_erp_valid[~df_erp_valid[key_col].isin(all_dupe_keys_set)].copy()
+
+    if df_ext_valid.empty or key_col not in df_ext_valid.columns:
+        df_ext_dupes = pd.DataFrame(columns=df_external.columns)
+        df_ext_clean = df_ext_valid.copy()
+    else:
+        df_ext_dupes = df_ext_valid[df_ext_valid[key_col].isin(all_dupe_keys_set)].copy()
+        df_ext_clean = df_ext_valid[~df_ext_valid[key_col].isin(all_dupe_keys_set)].copy()
 
     dupe_records = []
-    for k in all_dupe_keys:
+    for k in sorted_dupe_keys:
         in_erp = k in erp_dupe_keys
         in_ext = k in ext_dupe_keys
 
@@ -397,9 +553,7 @@ def reconcile_data(
             rows_ext["source_system"] = source_external_name
             dupe_records.append(rows_ext)
 
-    # -------------------------------------------------------------
-    # 5. One-to-One Vector Outer Merge on Clean Records
-    # -------------------------------------------------------------
+    # 6. One-to-One Vector Outer Merge on Clean Records
     merged = df_erp_clean.merge(
         df_ext_clean,
         on=key_col,
@@ -432,32 +586,36 @@ def reconcile_data(
         }
     )
 
-    # -------------------------------------------------------------
-    # 6. Field-Level Typed Comparison for Common Records
-    # -------------------------------------------------------------
+    # 7. Field-Level Typed Comparison for Common Records
     common = merged[merged["_merge"] == "both"].copy()
 
     common["reconciliation_status"] = STATUS_MATCH
     common["status_reason"] = ""
     common["mismatch_fields"] = ""
     common["mismatch_count"] = 0
-    common["amount_difference"] = None
+
+    # Initialize per-field variance columns for monetary fields
+    for col in comparison_fields:
+        rule = normalized_rules[col]
+        if rule["type"] == "money":
+            common[f"{col}_variance"] = None
+            common[f"{col}_abs_difference"] = None
 
     statuses = []
     status_reasons = []
     mismatch_fields_list = []
     mismatch_counts = []
-    amount_diffs = []
+    currency_mismatch_flags = []
 
     for idx, row in common.iterrows():
         row_mismatched_fields = []
         row_reasons = []
         row_has_invalid = False
-        row_amount_diff: Optional[Decimal] = None
+        is_currency_mismatch = False
 
         for col in comparison_fields:
-            rule = field_rules.get(col, {"type": "text"})
-            f_type = rule.get("type", "text")
+            rule = normalized_rules[col]
+            f_type = rule["type"]
 
             val_erp_raw = row.get(f"{col}{erp_suffix}")
             val_ext_raw = row.get(f"{col}{ext_suffix}")
@@ -469,24 +627,22 @@ def reconcile_data(
 
                 if dec_erp == INVALID_VALUE_SENTINEL or dec_ext == INVALID_VALUE_SENTINEL:
                     row_has_invalid = True
-                    row_reasons.append(
-                        f"{col} has invalid monetary format ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')"
-                    )
+                    row_reasons.append(f"{col} has invalid monetary format ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')")
                 elif dec_erp is None and dec_ext is None:
-                    pass
+                    common.at[idx, f"{col}_variance"] = Decimal("0")
+                    common.at[idx, f"{col}_abs_difference"] = Decimal("0")
                 elif dec_erp is None or dec_ext is None:
                     row_mismatched_fields.append(col)
-                    row_reasons.append(
-                        f"{col} missing in one dataset ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')"
-                    )
+                    row_reasons.append(f"{col} missing in one dataset ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')")
                 else:
-                    diff = abs(dec_erp - dec_ext)
-                    if diff > col_tol:
+                    variance = dec_ext - dec_erp  # External - ERP
+                    abs_diff = abs(variance)
+                    common.at[idx, f"{col}_variance"] = variance
+                    common.at[idx, f"{col}_abs_difference"] = abs_diff
+
+                    if abs_diff > col_tol:
                         row_mismatched_fields.append(col)
-                        row_amount_diff = diff
-                        row_reasons.append(
-                            f"{col} diff ({source_erp_name}: {dec_erp}, {source_external_name}: {dec_ext}, diff: {diff})"
-                        )
+                        row_reasons.append(f"{col} diff ({source_erp_name}: {dec_erp}, {source_external_name}: {dec_ext}, variance: {variance})")
 
             elif f_type == "text":
                 case_sens = rule.get("case_sensitive", False)
@@ -497,45 +653,34 @@ def reconcile_data(
                     pass
                 elif str_erp is None or str_ext is None:
                     row_mismatched_fields.append(col)
-                    row_reasons.append(
-                        f"{col} missing in one dataset ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')"
-                    )
+                    row_reasons.append(f"{col} missing in one dataset ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')")
                 else:
                     c_erp = str_erp if case_sens else str_erp.lower()
                     c_ext = str_ext if case_sens else str_ext.lower()
                     if c_erp != c_ext:
                         row_mismatched_fields.append(col)
-                        row_reasons.append(
-                            f"{col} mismatch ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')"
-                        )
+                        if col == "currency":
+                            is_currency_mismatch = True
+                        row_reasons.append(f"{col} mismatch ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')")
 
             elif f_type == "date":
-                fmt = rule.get("format", None)
-                str_erp = str(val_erp_raw).strip() if val_erp_raw is not None and not pd.isna(val_erp_raw) else None
-                str_ext = str(val_ext_raw).strip() if val_ext_raw is not None and not pd.isna(val_ext_raw) else None
+                fmt = rule.get("format", "%Y-%m-%d")
+                dt_erp = parse_date(val_erp_raw, fmt=fmt)
+                dt_ext = parse_date(val_ext_raw, fmt=fmt)
 
-                if str_erp is None and str_ext is None:
+                if dt_erp == INVALID_VALUE_SENTINEL or dt_ext == INVALID_VALUE_SENTINEL:
+                    row_has_invalid = True
+                    row_reasons.append(f"{col} has unparseable date format ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')")
+                elif dt_erp is None and dt_ext is None:
                     pass
-                elif str_erp is None or str_ext is None:
+                elif dt_erp is None or dt_ext is None:
+                    row_mismatched_fields.append(col)
+                    row_reasons.append(f"{col} date missing in one dataset ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')")
+                elif dt_erp != dt_ext:
                     row_mismatched_fields.append(col)
                     row_reasons.append(
-                        f"{col} date missing in one dataset ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')"
+                        f"{col} date mismatch ({source_erp_name}: {dt_erp.strftime('%Y-%m-%d')}, {source_external_name}: {dt_ext.strftime('%Y-%m-%d')})"
                     )
-                else:
-                    dt_erp = pd.to_datetime(str_erp, format=fmt, errors="coerce")
-                    dt_ext = pd.to_datetime(str_ext, format=fmt, errors="coerce")
-
-                    if pd.isna(dt_erp) or pd.isna(dt_ext):
-                        if str_erp != str_ext:
-                            row_mismatched_fields.append(col)
-                            row_reasons.append(
-                                f"{col} unparseable date mismatch ({source_erp_name}: '{val_erp_raw}', {source_external_name}: '{val_ext_raw}')"
-                            )
-                    elif dt_erp != dt_ext:
-                        row_mismatched_fields.append(col)
-                        row_reasons.append(
-                            f"{col} date mismatch ({source_erp_name}: {dt_erp.strftime('%Y-%m-%d')}, {source_external_name}: {dt_ext.strftime('%Y-%m-%d')})"
-                        )
 
         if row_has_invalid:
             statuses.append(STATUS_INVALID_FIELD_VALUE)
@@ -547,17 +692,15 @@ def reconcile_data(
         status_reasons.append("; ".join(row_reasons))
         mismatch_fields_list.append(", ".join(row_mismatched_fields))
         mismatch_counts.append(len(row_mismatched_fields))
-        amount_diffs.append(row_amount_diff)
+        currency_mismatch_flags.append(is_currency_mismatch)
 
     common["reconciliation_status"] = statuses
     common["status_reason"] = status_reasons
     common["mismatch_fields"] = mismatch_fields_list
     common["mismatch_count"] = mismatch_counts
-    common["amount_difference"] = amount_diffs
+    common["is_currency_mismatch"] = currency_mismatch_flags
 
-    # -------------------------------------------------------------
-    # 7. Aggregate Unified Category DataFrames
-    # -------------------------------------------------------------
+    # 8. Aggregate Unified Category DataFrames
     df_matches = common[common["reconciliation_status"] == STATUS_MATCH].copy()
     df_mismatches = common[common["reconciliation_status"] == STATUS_MISMATCH].copy()
 
@@ -574,15 +717,11 @@ def reconcile_data(
     if data_issue_components:
         df_data_issues = pd.concat(data_issue_components, ignore_index=True)
     else:
-        df_data_issues = pd.DataFrame(
-            columns=[key_col, "reconciliation_status", "status_reason", "source_system"]
-        )
+        df_data_issues = pd.DataFrame(columns=[key_col, "reconciliation_status", "status_reason", "source_system"])
 
     df_missing = missing_records.copy()
 
-    # -------------------------------------------------------------
-    # 8. Build All Records Complete Dataset
-    # -------------------------------------------------------------
+    # 9. Build Master Consolidated View (reconciliation_results / all_records)
     all_records_list = [common, df_missing]
     if invalid_key_records:
         all_records_list.extend(invalid_key_records)
@@ -592,13 +731,11 @@ def reconcile_data(
     df_all_records = pd.concat(all_records_list, ignore_index=True)
     df_all_records = df_all_records.drop(columns=["_merge"], errors="ignore")
 
-    primary_cols = [key_col, "reconciliation_status", "status_reason", "mismatch_fields", "amount_difference"]
+    primary_cols = [key_col, "reconciliation_status", "status_reason", "mismatch_fields", "mismatch_count"]
     other_cols = [c for c in df_all_records.columns if c not in primary_cols]
     df_all_records = df_all_records[primary_cols + other_cols]
 
-    # -------------------------------------------------------------
-    # 9. Summary KPIs & Financial Exposure Calculation
-    # -------------------------------------------------------------
+    # 10. Compute Explicit KPIs and Currency-Isolated Exposure
     total_erp_ingested = len(df_erp)
     total_ext_ingested = len(df_external)
     eligible_count = len(common)
@@ -606,7 +743,10 @@ def reconcile_data(
     mismatches_count = len(df_mismatches)
     missing_ext_count = len(df_missing[df_missing["reconciliation_status"] == STATUS_MISSING_IN_EXTERNAL])
     missing_erp_count = len(df_missing[df_missing["reconciliation_status"] == STATUS_MISSING_IN_ERP])
-    data_issues_count = len(df_data_issues)
+
+    data_issue_rows_count = len(df_data_issues)
+    distinct_issue_keys_count = df_data_issues[key_col].nunique() if not df_data_issues.empty else 0
+    currency_mismatch_count = common["is_currency_mismatch"].sum() if "is_currency_mismatch" in common.columns else 0
 
     match_rate = (matches_count / eligible_count * 100) if eligible_count > 0 else 0.0
     total_records = total_erp_ingested + total_ext_ingested
@@ -614,35 +754,37 @@ def reconcile_data(
     exception_rate = (unreconciled_count / total_records * 100) if total_records > 0 else 0.0
 
     summary_rows = [
-        {"Metric / Indicator": "Total ERP Records Ingested", "Value": total_erp_ingested},
-        {"Metric / Indicator": "Total External Records Ingested", "Value": total_ext_ingested},
-        {"Metric / Indicator": "Eligible 1-to-1 Reconciliation Population", "Value": eligible_count},
-        {"Metric / Indicator": "Fully Matched Records (MATCH)", "Value": matches_count},
-        {"Metric / Indicator": "Field Discrepancies (MISMATCH)", "Value": mismatches_count},
-        {"Metric / Indicator": "Missing in External (MISSING_IN_EXTERNAL)", "Value": missing_ext_count},
-        {"Metric / Indicator": "Missing in ERP (MISSING_IN_ERP)", "Value": missing_erp_count},
-        {"Metric / Indicator": "Data Quality Exceptions (Duplicates & Missing Keys)", "Value": data_issues_count},
-        {"Metric / Indicator": "Match Rate (%)", "Value": f"{match_rate:.2f}%"},
-        {"Metric / Indicator": "Overall Exception Rate (%)", "Value": f"{exception_rate:.2f}%"},
+        {"Metric / Indicator": "Total ERP Source Rows", "Value": total_erp_ingested},
+        {"Metric / Indicator": "Total External Source Rows", "Value": total_ext_ingested},
+        {"Metric / Indicator": "Eligible 1-to-1 Reconciliation Units", "Value": eligible_count},
+        {"Metric / Indicator": "Fully Matched Reconciliation Units (MATCH)", "Value": matches_count},
+        {"Metric / Indicator": "Mismatch Reconciliation Units (MISMATCH)", "Value": mismatches_count},
+        {"Metric / Indicator": "Missing in External Units (MISSING_IN_EXTERNAL)", "Value": missing_ext_count},
+        {"Metric / Indicator": "Missing in ERP Units (MISSING_IN_ERP)", "Value": missing_erp_count},
+        {"Metric / Indicator": "Data Quality Exception Rows", "Value": data_issue_rows_count},
+        {"Metric / Indicator": "Distinct Data Quality Exception Keys", "Value": distinct_issue_keys_count},
+        {"Metric / Indicator": "Currency Mismatch Count", "Value": int(currency_mismatch_count)},
+        {"Metric / Indicator": "Eligible Match Rate (%)", "Value": f"{match_rate:.2f}%"},
+        {"Metric / Indicator": "Reconciliation Unit Exception Rate (%)", "Value": f"{exception_rate:.2f}%"},
     ]
 
+    # Calculate monetary exposure ONLY when currencies are identical
     if "currency" in comparison_fields:
         curr_erp_col = f"currency_{source_erp_name.lower()}"
         curr_ext_col = f"currency_{source_external_name.lower()}"
 
-        if not df_mismatches.empty and "amount_difference" in df_mismatches.columns:
-            currencies = df_mismatches[curr_erp_col].fillna(df_mismatches[curr_ext_col]).unique()
-            for curr in currencies:
-                if pd.isna(curr) or not curr:
-                    continue
-                curr_mask = (df_mismatches[curr_erp_col] == curr) | (df_mismatches[curr_ext_col] == curr)
-                exposure = df_mismatches[curr_mask]["amount_difference"].dropna().sum()
-                summary_rows.append(
-                    {
-                        "Metric / Indicator": f"Mismatched Exposure ({curr})",
-                        "Value": f"{exposure:.2f}",
-                    }
-                )
+        if not df_mismatches.empty:
+            same_currency_mismatches = df_mismatches[df_mismatches[curr_erp_col].str.lower() == df_mismatches[curr_ext_col].str.lower()]
+            if not same_currency_mismatches.empty and "amount_abs_difference" in same_currency_mismatches.columns:
+                for curr in same_currency_mismatches[curr_erp_col].dropna().unique():
+                    c_df = same_currency_mismatches[same_currency_mismatches[curr_erp_col] == curr]
+                    exposure = c_df["amount_abs_difference"].dropna().sum()
+                    summary_rows.append(
+                        {
+                            "Metric / Indicator": f"Mismatched Exposure ({curr})",
+                            "Value": f"{exposure:.2f}",
+                        }
+                    )
 
         if not df_missing.empty:
             amt_erp_col = f"amount_{source_erp_name.lower()}"
@@ -652,10 +794,10 @@ def reconcile_data(
             if not missing_ext_df.empty and amt_erp_col in missing_ext_df.columns:
                 for curr in missing_ext_df[curr_erp_col].dropna().unique():
                     c_df = missing_ext_df[missing_ext_df[curr_erp_col] == curr]
-                    sum_amt = c_df[amt_erp_col].apply(parse_decimal).map(lambda x: x if isinstance(x, Decimal) else Decimal('0')).sum()
+                    sum_amt = c_df[amt_erp_col].apply(parse_decimal).map(lambda x: x if isinstance(x, Decimal) else Decimal("0")).sum()
                     summary_rows.append(
                         {
-                            "Metric / Indicator": f"Missing in External Financial Exposure ({curr})",
+                            "Metric / Indicator": f"Missing in External Exposure ({curr})",
                             "Value": f"{sum_amt:.2f}",
                         }
                     )
@@ -664,26 +806,34 @@ def reconcile_data(
             if not missing_erp_df.empty and amt_ext_col in missing_erp_df.columns:
                 for curr in missing_erp_df[curr_ext_col].dropna().unique():
                     c_df = missing_erp_df[missing_erp_df[curr_ext_col] == curr]
-                    sum_amt = c_df[amt_ext_col].apply(parse_decimal).map(lambda x: x if isinstance(x, Decimal) else Decimal('0')).sum()
+                    sum_amt = c_df[amt_ext_col].apply(parse_decimal).map(lambda x: x if isinstance(x, Decimal) else Decimal("0")).sum()
                     summary_rows.append(
                         {
-                            "Metric / Indicator": f"Missing in ERP Financial Exposure ({curr})",
+                            "Metric / Indicator": f"Missing in ERP Exposure ({curr})",
                             "Value": f"{sum_amt:.2f}",
                         }
                     )
 
     df_summary = pd.DataFrame(summary_rows)
 
+    # 11. Run Metadata Sheet
+    serialized_rules = json.dumps(
+        {k: {rk: str(rv) for rk, rv in v.items()} for k, v in normalized_rules.items()},
+        indent=2,
+    )
+
     df_metadata = pd.DataFrame(
         [
             {"Parameter": "Run ID", "Value": run_id},
-            {"Parameter": "Run Timestamp", "Value": run_timestamp},
-            {"Parameter": "Tool Version", "Value": "1.0.0"},
+            {"Parameter": "Run Timestamp UTC", "Value": run_timestamp_utc},
+            {"Parameter": "Tool Version", "Value": get_tool_version()},
             {"Parameter": "Primary Key Column", "Value": key_col},
             {"Parameter": "Amount Tolerance Threshold", "Value": str(amount_tolerance)},
             {"Parameter": "Compared Fields", "Value": ", ".join(comparison_fields)},
+            {"Parameter": "Serialized Field Rules", "Value": serialized_rules},
             {"Parameter": f"{source_erp_name} Total Ingested Rows", "Value": total_erp_ingested},
             {"Parameter": f"{source_external_name} Total Ingested Rows", "Value": total_ext_ingested},
+            {"Parameter": "Eligible 1-to-1 Reconciliation Units", "Value": eligible_count},
         ]
     )
 
@@ -705,19 +855,25 @@ def write_output(
     output_folder: str,
     output_filename: Optional[str] = None,
     metadata_info: Optional[Dict[str, str]] = None,
+    overwrite: bool = False,
 ) -> str:
     """
     Writes reconciliation results into a multi-sheet Excel workbook.
+    Prevents silent file overwrites unless overwrite=True.
     """
     output_folder = output_folder.strip().strip('"').strip("'")
     if not os.path.exists(output_folder):
         os.makedirs(output_folder, exist_ok=True)
 
     if not output_filename:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"reconciliation_output_{timestamp}.xlsx"
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        short_id = str(uuid.uuid4())[:8]
+        output_filename = f"reconciliation_{timestamp_str}_{short_id}.xlsx"
 
     output_path = os.path.join(output_folder, output_filename)
+
+    if os.path.exists(output_path) and not overwrite:
+        raise OutputError(f"Output file '{output_path}' already exists. Use --overwrite flag to explicitly overwrite.")
 
     if metadata_info and "run_metadata" in results:
         meta_df = results["run_metadata"].copy()
@@ -732,9 +888,9 @@ def write_output(
             if sheet_name in results:
                 df = results[sheet_name].copy()
 
+                # Apply formula injection protection to string cells regardless of pandas dtype
                 for col in df.columns:
-                    if df[col].dtype == object:
-                        df[col] = df[col].apply(sanitize_excel_cell_value)
+                    df[col] = df[col].map(lambda value: sanitize_excel_cell_value(value) if isinstance(value, str) else value)
 
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
 
@@ -788,6 +944,7 @@ def parse_cli_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--erp", type=str, help="Path to ERP / System of Record dataset (CSV/XLSX)")
     parser.add_argument("--external", type=str, help="Path to External / Bank dataset (CSV/XLSX)")
+    parser.add_argument("--config", type=str, help="Path to JSON reconciliation configuration file")
     parser.add_argument("--output", type=str, default="output", help="Output directory path")
     parser.add_argument("--key", type=str, default=DEFAULT_KEY_COLUMN, help="Primary key column name")
     parser.add_argument(
@@ -796,11 +953,8 @@ def parse_cli_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=0.01,
         help="Monetary comparison tolerance threshold (e.g. 0.01)",
     )
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Force interactive mode prompts for missing arguments",
-    )
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite output file if it already exists")
+    parser.add_argument("--interactive", action="store_true", help="Force interactive mode prompts for missing arguments")
     return parser.parse_args(args)
 
 
@@ -816,9 +970,19 @@ def main():
 
     erp_path = args.erp
     external_path = args.external
+    config_path = args.config
     output_folder = args.output
     key_column = args.key
     tolerance = Decimal(str(args.amount_tolerance))
+    field_rules = None
+    config_hash = None
+
+    if config_path:
+        config_data, key_column_from_config, config_hash = load_config_file(config_path)
+        if "key_column" in config_data:
+            key_column = config_data["key_column"]
+        if "field_rules" in config_data:
+            field_rules = config_data["field_rules"]
 
     if not erp_path or not external_path or args.interactive:
         erp_path = input("Enter ERP / System of Record file path: ").strip()
@@ -847,6 +1011,7 @@ def main():
             df_ext,
             key_column=key_column,
             amount_tolerance=tolerance,
+            field_rules=field_rules,
             source_erp_name="ERP",
             source_external_name="External",
         )
@@ -857,9 +1022,12 @@ def main():
             "External File Path": external_path,
             "External File SHA-256": ext_hash,
         }
+        if config_path:
+            metadata_info["Config File Path"] = config_path
+            metadata_info["Config File SHA-256"] = config_hash
 
         logger.info("Generating formatted Excel workbook...")
-        output_file = write_output(results, output_folder, metadata_info=metadata_info)
+        output_file = write_output(results, output_folder, metadata_info=metadata_info, overwrite=args.overwrite)
 
         print("\n[SUCCESS] Reconciliation Completed Successfully!")
         print("\n[SUMMARY] Executive KPI Dashboard:")

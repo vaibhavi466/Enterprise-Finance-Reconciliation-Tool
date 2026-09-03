@@ -24,13 +24,21 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install .
+        pip install -e ".[dev]"
 
-    - name: Run unit tests
+    - name: Run Ruff Lint Check
+      run: |
+        ruff check .
+
+    - name: Run Ruff Format Check
+      run: |
+        ruff format --check .
+
+    - name: Run Unit & Integration Test Suite
       run: |
         python -m unittest discover tests
 
-    - name: Test sample data generation and end-to-end reconciliation
+    - name: Test Sample Data Generation & CLI End-to-End Execution
       run: |
         python generate_sample_data.py
-        python reconciliation.py --erp sample_data/erp_data.csv --external sample_data/bank_data.xlsx --output output --key invoice_id --amount-tolerance 0.01
+        python reconciliation.py --erp sample_data/erp_data.csv --external sample_data/bank_data.xlsx --config reconciliation_config.json --output output --key invoice_id --amount-tolerance 0.01 --overwrite

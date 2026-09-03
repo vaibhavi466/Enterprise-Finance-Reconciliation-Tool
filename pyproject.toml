@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "enterprise-finance-reconciliation-tool"
 version = "1.0.0"
-description = "Rule-driven Python finance reconciliation engine with duplicate isolation, tolerance-based matching, exception reporting, and auditable Excel outputs."
+description = "Rule-driven Python finance reconciliation engine with duplicate isolation, Decimal-based matching, exception reporting, and auditable Excel outputs."
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = [
@@ -26,18 +26,20 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0.0",
     "ruff>=0.4.0",
 ]
 
+[project.scripts]
+finance-reconcile = "reconciliation:main"
+
 [tool.ruff]
-line-length = 100
+line-length = 160
 target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
-ignore = []
+ignore = ["E501"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = "test_*.py"
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

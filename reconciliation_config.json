@@ -1,0 +1,21 @@
+{
+  "key_column": "invoice_id",
+  "field_rules": {
+    "amount": {
+      "type": "money",
+      "tolerance": "0.01"
+    },
+    "currency": {
+      "type": "text",
+      "case_sensitive": false
+    },
+    "customer_name": {
+      "type": "text",
+      "case_sensitive": false
+    },
+    "date": {
+      "type": "date",
+      "format": "%Y-%m-%d"
+    }
+  }
+}
